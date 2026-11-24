@@ -1,0 +1,11 @@
+{
+  "name": "raising-saints-calendar-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two-way sync between Google Calendar and Shop-Ware appointments (Google Apps Script)",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "push": "clasp push",
+    "logs": "clasp logs"
+  }
+}
