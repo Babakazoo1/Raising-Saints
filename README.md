@@ -38,8 +38,8 @@ Shop-Ware issues these through its Technology Partner program, and your shop has
 Sign in to Google as the account that should **own** the calendars. A shop account like `office@…` is better than a personal one, so the sync doesn't depend on one employee.
 
 1. Go to <https://script.google.com> and click **New project**. Name it "Shop-Ware Calendar Sync".
-2. Open **Project Settings** (gear icon). Tick **Show "appsscript.json" manifest file in editor**. Set the **time zone** to your shop's.
-3. Back in the **Editor**, create one script file for each file in `src/` (`Config`, `Format`, `Alerts`, `ShopWare`, `Sync`, `Setup`) and paste in its contents. Replace the contents of `appsscript.json` with `src/appsscript.json`, and change `"timeZone"` there to your shop's time zone.
+2. Open **Project Settings** (gear icon). Tick **Show "appsscript.json" manifest file in editor**. Set the **time zone** to **(GMT-07:00) Mountain Time – Denver**.
+3. Back in the **Editor**, create one script file for each file in `src/` (`Config`, `Format`, `Alerts`, `ShopWare`, `Sync`, `Setup`) and paste in its contents. Replace the contents of `appsscript.json` with `src/appsscript.json`. It's already set to Mountain time (`America/Denver`, which handles daylight saving). In Arizona, which doesn't observe daylight saving, change it to `America/Phoenix`.
    - *Developer alternative:* `npm i -g @google/clasp`, `clasp login`, copy `.clasp.json.example` to `.clasp.json` with your script ID, then `clasp push`.
 
 ### 3. Add your Shop-Ware keys (kept out of the code)

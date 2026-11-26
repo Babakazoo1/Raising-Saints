@@ -211,7 +211,7 @@ function makeEnv(opts = {}) {
     },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock() {} }) },
     MailApp: { sendEmail: (m) => mail.push(m) },
-    Session: { getEffectiveUser: () => ({ getEmail: () => 'owner@example.com' }), getScriptTimeZone: () => 'America/Chicago' },
+    Session: { getEffectiveUser: () => ({ getEmail: () => 'owner@example.com' }), getScriptTimeZone: () => 'America/Denver' },
     Utilities: { sleep() {} },
     ScriptApp: {
       getProjectTriggers: () => triggers.slice(),
