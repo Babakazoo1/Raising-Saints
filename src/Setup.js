@@ -65,9 +65,32 @@ function installTriggers_() {
   ScriptApp.newTrigger('healthCheck').timeBased().everyHours(1).create();
 }
 
+/**
+ * Run this first, once SHOPWARE_PARTNER_ID and SHOPWARE_SECRET are saved.
+ * Logs the tenant and shop ids your API key can use. Read-only.
+ */
+function findShopIds() {
+  var tenants = listResults_(swRequest_('get', 'tenants', { root: true }));
+  if (!tenants.length) {
+    console.log('Your API key works but no shop is authorized yet. Ask Shop-Ware support to authorize ' +
+      'your shop (tenant) for this partner key.');
+    return;
+  }
+  tenants.forEach(function (t) {
+    console.log('SHOPWARE_TENANT_ID = ' + t.id + '   (' + (t.name || t.subdomain || '') + ')');
+    var shops = listResults_(swRequest_('get', 'tenants/' + encodeURIComponent(t.id) + '/shops', { root: true }));
+    shops.forEach(function (shop) {
+      console.log('    SHOPWARE_SHOP_ID = ' + shop.id + '   ' + (shop.name || '') +
+        (shop.time_zone ? '   time zone: ' + shop.time_zone : ''));
+    });
+  });
+  console.log('Copy the right values into Script Properties. If your shop time zone differs from ' +
+    Session.getScriptTimeZone() + ', change it in Project Settings too.');
+}
+
 /** Checks the Shop-Ware credentials. Returns a human-readable result. */
 function testConnection() {
-  var body = swRequest_('get', CONFIG.PATHS.appointments, { query: { page: 1, per_page: 1 } });
+  var body = swRequest_('get', CONFIG.PATHS.appointments, { query: { shop_id: swShopId_(), page: 1, per_page: 1 } });
   var msg = 'Shop-Ware connection OK (' + listResults_(body).length + ' appointment(s) on the first page).';
   console.log(msg);
   return msg;
@@ -86,12 +109,20 @@ function sendTestAlert() {
  */
 function debugDumpAppointment() {
   var A = CONFIG.FIELDS.appointment;
-  var list = listResults_(swRequest_('get', CONFIG.PATHS.appointments, { query: { page: 1, per_page: 5 } }));
-  if (!list.length) { console.log('No appointments returned.'); return; }
-  var appt = list[list.length - 1];
+  var query = { shop_id: swShopId_(), page: 1, per_page: 5 };
+  query[CONFIG.START_AFTER_PARAM] = new Date(Date.now() - 86400000).toISOString();
+  var list = listResults_(swRequest_('get', CONFIG.PATHS.appointments, { query: query }));
+  if (!list.length) { console.log('No upcoming appointments returned.'); return; }
+  var appt = list.filter(function (a) { return pickField_(a, A.repairOrderId); })[0] || list[0];
   console.log('APPOINTMENT:\n' + JSON.stringify(appt, null, 2));
-  var cid = pickField_(appt, A.customerId);
-  var vid = pickField_(appt, A.vehicleId);
+  var ro = null;
+  var roId = pickField_(appt, A.repairOrderId);
+  if (roId) {
+    ro = unwrap_(swRequest_('get', CONFIG.PATHS.repairOrders + '/' + roId, { allow404: true }), 'repair_order');
+    console.log('REPAIR ORDER:\n' + JSON.stringify(ro, null, 2));
+  }
+  var cid = pickField_(appt, A.customerId) || pickField_(ro, CONFIG.FIELDS.repairOrder.customerId);
+  var vid = pickField_(appt, A.vehicleId) || pickField_(ro, CONFIG.FIELDS.repairOrder.vehicleId);
   if (cid) console.log('CUSTOMER:\n' + JSON.stringify(swRequest_('get', CONFIG.PATHS.customers + '/' + cid, { allow404: true }), null, 2));
   if (vid) console.log('VEHICLE:\n' + JSON.stringify(swRequest_('get', CONFIG.PATHS.vehicles + '/' + vid, { allow404: true }), null, 2));
   console.log('RENDERED EVENT:\n' + JSON.stringify(renderEvent_(swLoadView_(appt)), null, 2));
@@ -108,5 +139,6 @@ function resetSync() {
 
 /** Refresh every synced event right now (also picks up filter changes). */
 function reconcileNow() {
+  deleteBudget_ = CONFIG.MAX_DELETES_PER_RUN;
   maybeReconcile_(configuredCalendars_(), true);
 }

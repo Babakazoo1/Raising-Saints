@@ -103,8 +103,11 @@ function makeCalendar() {
   return { Calendar: { Events, Acl }, CalendarApp, cals, user };
 }
 
+// Appointment fields allowed on writes, per Shop-Ware's v1 spec.
+const APPT_WRITABLE = ['shop_id', 'staff_id', 'repair_order_id', 'title', 'description', 'start_at', 'end_at', 'integrator_tags'];
+
 function makeShopware() {
-  const db = { appointments: {}, customers: {}, vehicles: {}, repair_orders: {}, staffs: {} };
+  const db = { appointments: {}, customers: {}, vehicles: {}, repair_orders: {}, staffs: {}, shops: { 7: { id: 7, name: 'Raising Saints', time_zone: 'America/Denver' } } };
   let nextId = 1000;
   const sw = {
     db,
@@ -113,6 +116,11 @@ function makeShopware() {
     // Behaves like Shop-Ware's REST API; returns [status, bodyObject].
     handle(method, url, payload, headers) {
       const u = new URL(url);
+      if (u.pathname === '/api/v1/tenants') {
+        sw.calls.push('GET /api/v1/tenants');
+        if (sw.authFail || headers['X-Api-Secret'] !== 'secret') return [401, {}];
+        return [200, { results: [{ id: 42, name: 'Raising Saints Auto' }] }];
+      }
       const m = u.pathname.match(/^\/api\/v1\/tenants\/([^/]+)\/([a-z_]+)(?:\/([^/]+))?$/);
       sw.calls.push(method.toUpperCase() + ' ' + u.pathname + u.search);
       if (sw.authFail || headers['X-Api-Secret'] !== 'secret') return [401, { error: 'Unauthorized' }];
@@ -124,6 +132,8 @@ function makeShopware() {
       if (method === 'get' && !id) {
         let rows = Object.values(table);
         const q = u.searchParams;
+        if (q.get('shop_id') && coll === 'appointments') rows = rows.filter((r) => String(r.shop_id) === q.get('shop_id'));
+        if (q.get('start_after')) rows = rows.filter((r) => r.start_at >= q.get('start_after'));
         if (q.get('updated_after')) rows = rows.filter((r) => !r.updated_at || r.updated_at >= q.get('updated_after'));
         if (q.get('phone')) rows = rows.filter((r) => JSON.stringify(r.phones || []).replace(/\D/g, '').includes(q.get('phone').replace(/\D/g, '')));
         if (q.get('email')) rows = rows.filter((r) => JSON.stringify(r.emails || []).includes(q.get('email')));
@@ -134,14 +144,22 @@ function makeShopware() {
       if (method === 'get') return table[id] ? [200, clone(table[id])] : [404, {}];
       if (method === 'post') {
         const body = JSON.parse(payload);
-        if (!body.start_at) return [422, { errors: ['start_at required'] }];
+        if (coll === 'appointments') {
+          const bad = Object.keys(body).filter((k) => !APPT_WRITABLE.includes(k));
+          if (bad.length) return [422, { errors: ['unknown fields: ' + bad.join(', ')] }];
+          if (!body.shop_id || !body.start_at) return [422, { errors: ['shop_id and start_at required'] }];
+          if (!body.title && !body.repair_order_id) return [422, { errors: ['title or repair_order_id required'] }];
+        }
         const rec = Object.assign({ id: nextId++ }, body, { created_at: now, updated_at: now });
         table[rec.id] = rec;
         return [201, clone(rec)];
       }
       if (method === 'put') {
         if (!table[id]) return [404, {}];
-        Object.assign(table[id], JSON.parse(payload), { updated_at: now });
+        const upd = JSON.parse(payload);
+        const badU = Object.keys(upd).filter((k) => !APPT_WRITABLE.includes(k));
+        if (coll === 'appointments' && badU.length) return [422, { errors: ['unknown fields: ' + badU.join(', ')] }];
+        Object.assign(table[id], upd, { updated_at: now });
         return [200, clone(table[id])];
       }
       if (method === 'delete') {
@@ -154,7 +172,7 @@ function makeShopware() {
     // Helpers for tests: act like someone using Shop-Ware.
     addAppointment(fields) {
       const now = new Date().toISOString();
-      const rec = Object.assign({ id: nextId++, created_at: now, updated_at: now }, fields);
+      const rec = Object.assign({ id: nextId++, shop_id: 7, created_at: now, updated_at: now }, fields);
       db.appointments[rec.id] = rec;
       return rec;
     },
@@ -225,6 +243,7 @@ function makeEnv(opts = {}) {
     store.SHOPWARE_PARTNER_ID = 'partner';
     store.SHOPWARE_SECRET = 'secret';
     store.SHOPWARE_TENANT_ID = '42';
+    store.SHOPWARE_SHOP_ID = '7';
   }
   const run = (code) => vm.runInContext(code, context);
   return { context, run, cal, sw, store, mail, triggers, webhooks };

@@ -3,17 +3,22 @@
  * Auth: X-Api-Partner-Id + X-Api-Secret headers; every path is under /tenants/{tenant}/.
  */
 
-function swCredentials_() {
+/** opts.keysOnly: only the API keys are needed (used by findShopIds). */
+function swCredentials_(opts) {
   var p = PropertiesService.getScriptProperties();
   var c = {
     partnerId: p.getProperty('SHOPWARE_PARTNER_ID'),
     secret: p.getProperty('SHOPWARE_SECRET'),
     tenant: p.getProperty('SHOPWARE_TENANT_ID'),
+    shopId: p.getProperty('SHOPWARE_SHOP_ID'),
   };
   var missing = [];
   if (!c.partnerId) missing.push('SHOPWARE_PARTNER_ID');
   if (!c.secret) missing.push('SHOPWARE_SECRET');
-  if (!c.tenant) missing.push('SHOPWARE_TENANT_ID');
+  if (!(opts && opts.keysOnly)) {
+    if (!c.tenant) missing.push('SHOPWARE_TENANT_ID (run findShopIds)');
+    if (!c.shopId) missing.push('SHOPWARE_SHOP_ID (run findShopIds)');
+  }
   if (missing.length) throw new SyncError('CONFIG', 'Missing Script Properties: ' + missing.join(', '));
   return c;
 }
@@ -30,13 +35,14 @@ function buildQuery_(query) {
 
 /**
  * One API call with retries for 429/5xx.
- * opts: { query, body, allow404 }
+ * opts: { query, body, allow404, root }  (root: path is not under /tenants/{id}/)
  * Returns parsed JSON, or null for an allowed 404.
  */
 function swRequest_(method, path, opts) {
   opts = opts || {};
-  var c = swCredentials_();
-  var url = CONFIG.SHOPWARE_BASE_URL + '/tenants/' + encodeURIComponent(c.tenant) + '/' + path + buildQuery_(opts.query);
+  var c = swCredentials_({ keysOnly: !!opts.root });
+  var prefix = opts.root ? '/' : '/tenants/' + encodeURIComponent(c.tenant) + '/';
+  var url = CONFIG.SHOPWARE_BASE_URL + prefix + path + buildQuery_(opts.query);
   var params = {
     method: method,
     muteHttpExceptions: true,
@@ -97,15 +103,23 @@ function listResults_(body) {
   return body.results || body.data || body.items || body.records || [];
 }
 
-/** All pages of a list endpoint. */
+function swShopId_() {
+  return PropertiesService.getScriptProperties().getProperty('SHOPWARE_SHOP_ID');
+}
+
+/** All pages of a list endpoint (appointments are limited to our shop). */
 function swListAll_(path, query) {
   var out = [];
+  var seen = {};
   var page = 1;
   for (;;) {
-    var q = Object.assign({}, query || {}, { page: page, per_page: CONFIG.PAGE_SIZE });
+    var q = Object.assign({ shop_id: swShopId_() }, query || {}, { page: page, per_page: CONFIG.PAGE_SIZE });
     var body = swRequest_('get', path, { query: q });
     var results = listResults_(body);
-    out = out.concat(results);
+    results.forEach(function (r) {
+      var key = r && r.id !== undefined ? String(r.id) : null;
+      if (key === null || !seen[key]) { if (key !== null) seen[key] = true; out.push(r); }
+    });
     var totalPages = body && (body.total_pages || (body.meta && body.meta.total_pages));
     if (!results.length) break;
     if (totalPages ? page >= totalPages : results.length < CONFIG.PAGE_SIZE) break;
@@ -143,53 +157,52 @@ function swGetAppointment_(id) {
   return unwrap_(swRequest_('get', CONFIG.PATHS.appointments + '/' + encodeURIComponent(id), { allow404: true }), 'appointment');
 }
 
-function swCreateAppointment_(body) {
-  return unwrap_(swRequest_('post', CONFIG.PATHS.appointments, { body: body }), 'appointment');
+/** Shop-Ware requires shop_id + start_at, and a title or repair_order_id. */
+function swCreateAppointment_(fields) {
+  var body = Object.assign({}, fields);
+  body[CONFIG.FIELDS.appointment.shopId[0]] = Number(swShopId_()) || swShopId_();
+  return unwrap_(swRequest_('post', CONFIG.PATHS.appointments, { body: wrapWrite_(body) }), 'appointment');
+}
+
+function wrapWrite_(body) {
+  if (!CONFIG.WRITE_WRAPPER_KEY) return body;
+  var w = {};
+  w[CONFIG.WRITE_WRAPPER_KEY] = body;
+  return w;
+}
+
+/** True if the appointment belongs to another shop in the same tenant. */
+function isOtherShop_(appt) {
+  var shop = pickField_(appt, CONFIG.FIELDS.appointment.shopId);
+  var mine = swShopId_();
+  return shop !== undefined && mine && String(shop) !== String(mine);
 }
 
 function swUpdateAppointment_(id, body) {
-  return unwrap_(swRequest_('put', CONFIG.PATHS.appointments + '/' + encodeURIComponent(id), { body: body }), 'appointment');
+  return unwrap_(swRequest_('put', CONFIG.PATHS.appointments + '/' + encodeURIComponent(id), { body: wrapWrite_(body) }), 'appointment');
 }
 
 function swDeleteAppointment_(id) {
   return swRequest_('delete', CONFIG.PATHS.appointments + '/' + encodeURIComponent(id), { allow404: true });
 }
 
-/** Collect the related customer/vehicle/RO/advisor and build the view. */
+/**
+ * Collect the related repair order, customer, vehicle and advisor, and build
+ * the view. Appointments link to a repair order, which carries the customer
+ * and vehicle ids.
+ */
 function swLoadView_(appt) {
   var A = CONFIG.FIELDS.appointment;
-  var customer = swGetCached_(CONFIG.PATHS.customers, pickField_(appt, A.customerId), 'customer');
-  var vehicle = swGetCached_(CONFIG.PATHS.vehicles, pickField_(appt, A.vehicleId), 'vehicle');
+  var R = CONFIG.FIELDS.repairOrder;
   var ro = swGetCached_(CONFIG.PATHS.repairOrders, pickField_(appt, A.repairOrderId), 'repair_order');
+  var customerId = pickField_(appt, A.customerId);
+  if (customerId === undefined) customerId = pickField_(ro, R.customerId);
+  var vehicleId = pickField_(appt, A.vehicleId);
+  if (vehicleId === undefined) vehicleId = pickField_(ro, R.vehicleId);
+  var customer = swGetCached_(CONFIG.PATHS.customers, customerId, 'customer');
+  var vehicle = swGetCached_(CONFIG.PATHS.vehicles, vehicleId, 'vehicle');
   var advisor = swGetCached_(CONFIG.PATHS.staff, pickField_(appt, A.advisorId), 'staff');
   var view = buildView_(appt, customer, vehicle, ro, advisor);
   view.tenant = PropertiesService.getScriptProperties().getProperty('SHOPWARE_TENANT_ID');
   return view;
-}
-
-/** Best-effort customer match for an event typed into Google. */
-function swFindCustomer_(fields) {
-  var P = CONFIG.CUSTOMER_SEARCH_PARAMS;
-  var tries = [];
-  if (fields.phone && P.phone) tries.push([P.phone, fields.phone.replace(/[^0-9+]/g, '')]);
-  if (fields.email && P.email) tries.push([P.email, fields.email]);
-  for (var i = 0; i < tries.length; i++) {
-    var q = {};
-    q[tries[i][0]] = tries[i][1];
-    q.per_page = 5;
-    var results;
-    try {
-      results = listResults_(swRequest_('get', CONFIG.PATHS.customers, { query: q }));
-    } catch (e) {
-      if (e instanceof SyncError && e.category === 'DATA') continue; // search param not supported
-      throw e;
-    }
-    // Only accept an unambiguous match that actually contains what we searched for.
-    var needle = String(tries[i][1]).toLowerCase().replace(/[^0-9a-z@.+]/g, '');
-    var matches = results.filter(function (c) {
-      return JSON.stringify(c).toLowerCase().replace(/[^0-9a-z@.+"]/g, '').indexOf(needle.replace(/^\+?1(?=\d{10}$)/, '')) !== -1;
-    });
-    if (matches.length === 1) return matches[0];
-  }
-  return null;
 }

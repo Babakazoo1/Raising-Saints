@@ -136,7 +136,8 @@ function buildView_(appt, customer, vehicle, repairOrder, advisor) {
   };
   view.flags = detectFlags_(appt, title + '\n' + notes);
   view.text = [title, notes, view.customerName, view.vehicleName, view.advisorName].join('\n').toLowerCase();
-  view.cancelled = CONFIG.CANCELLED_STATUSES.indexOf(view.status) !== -1;
+  view.cancelled = CONFIG.CANCELLED_STATUSES.indexOf(view.status) !== -1 ||
+    title.toUpperCase().indexOf(CONFIG.CANCELLED_TITLE_PREFIX.toUpperCase()) === 0;
   return view;
 }
 

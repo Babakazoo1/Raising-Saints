@@ -6,7 +6,8 @@
  *
  *   SHOPWARE_PARTNER_ID   (required)  X-Api-Partner-Id issued by Shop-Ware
  *   SHOPWARE_SECRET       (required)  X-Api-Secret issued by Shop-Ware
- *   SHOPWARE_TENANT_ID    (required)  your shop's tenant id in Shop-Ware
+ *   SHOPWARE_TENANT_ID    (required)  your tenant id in Shop-Ware  } run findShopIds()
+ *   SHOPWARE_SHOP_ID      (required)  your shop id in Shop-Ware    } to look these up
  *   ALERT_EMAILS          (optional)  comma-separated; defaults to the script owner
  *   ALERT_WEBHOOK_URL     (optional)  Google Chat / Slack incoming-webhook URL
  */
@@ -24,7 +25,16 @@ var CONFIG = {
   SYNC_FUTURE_DAYS: 120,           // and this far ahead
   DEFAULT_DURATION_MINUTES: 60,    // used when an appointment has no end time
   RECONCILE_EVERY_MINUTES: 60,     // how often to look for appointments deleted in Shop-Ware
-  ALLOW_DELETE_FROM_GOOGLE: true,  // deleting the Google event deletes the Shop-Ware appointment
+  // What deleting an event in Google does to the Shop-Ware appointment:
+  //   'cancel'  rename it "[CANCELLED] ..." in Shop-Ware (reversible; Shop-Ware has no cancelled flag)
+  //   'delete'  delete it from Shop-Ware
+  //   'restore' do nothing in Shop-Ware and put the Google event back
+  GOOGLE_DELETE_BEHAVIOR: 'cancel',
+  CANCELLED_TITLE_PREFIX: '[CANCELLED]',
+  // Safety brake: if more deletions than this show up in one run (e.g. someone
+  // deleted the whole calendar), deletions pause and you get an alert.
+  // Run resumeDeletes() after checking.
+  MAX_DELETES_PER_RUN: 10,
 
   // ---- Alerts ---------------------------------------------------------------
   ALERT_REPEAT_HOURS: 6,           // don't repeat the same alert more often than this
@@ -64,9 +74,13 @@ var CONFIG = {
   ],
 
   // ---- Shop-Ware field mapping ---------------------------------------------
-  // Run debugDumpAppointment() once with real credentials and compare the logged
-  // JSON against these names. Each entry can list several candidate names; the
-  // first one present on the record wins.
+  // Shop-Ware's v1 spec lists these appointment fields: id, shop_id, staff_id,
+  // repair_order_id, title, description, start_at, end_at, created_at,
+  // updated_at, integrator_tags. Appointments have NO customer/vehicle id and
+  // NO cancelled/status flag: the customer and vehicle come from the linked
+  // repair order, and deleted appointments simply disappear (404).
+  // Run debugDumpAppointment() once with real credentials to confirm. Each
+  // entry can list several candidate names; the first one present wins.
   FIELDS: {
     appointment: {
       id: ['id'],
@@ -74,10 +88,11 @@ var CONFIG = {
       end: ['end_at', 'ends_at', 'end_time', 'end'],
       title: ['title', 'name', 'summary'],
       notes: ['description', 'notes', 'note', 'comments'],
-      customerId: ['customer_id'],
-      vehicleId: ['vehicle_id'],
+      customerId: ['customer_id'],          // not in the v1 spec; taken from the repair order
+      vehicleId: ['vehicle_id'],            // not in the v1 spec; taken from the repair order
       repairOrderId: ['repair_order_id'],
-      advisorId: ['advisor_id', 'service_writer_id', 'staff_id', 'user_id'],
+      advisorId: ['staff_id', 'advisor_id', 'service_writer_id'],
+      shopId: ['shop_id'],
       status: ['status', 'state'],
       updatedAt: ['updated_at'],
       // Optional dedicated flags. If Shop-Ware has no such field, the sync falls
@@ -105,6 +120,8 @@ var CONFIG = {
     },
     repairOrder: {
       number: ['number', 'ro_number', 'id'],
+      customerId: ['customer_id'],
+      vehicleId: ['vehicle_id'],
     },
     staff: {
       firstName: ['first_name'],
@@ -121,16 +138,17 @@ var CONFIG = {
     repairOrders: 'repair_orders',
     staff: 'staffs',
   },
-  // Query parameter Shop-Ware uses for "changed since". Results are also
-  // filtered locally, so if the API ignores it the sync is still correct.
+  // List filters from the v1 spec (UTC ISO-8601). Results are also filtered
+  // locally, so the sync stays correct even if one is ignored.
   UPDATED_SINCE_PARAM: 'updated_after',
+  START_AFTER_PARAM: 'start_after',
   // If Shop-Ware expects writes wrapped like {"appointment": {...}}, set this to
   // 'appointment'. null sends the fields at the top level.
   WRITE_WRAPPER_KEY: null,
-  // Query parameters to try when looking up a customer for an event made in Google.
-  CUSTOMER_SEARCH_PARAMS: { phone: 'phone', email: 'email' },
-  // Appointment statuses meaning "this is cancelled" (lowercase)
-  CANCELLED_STATUSES: ['cancelled', 'canceled', 'deleted', 'no_show_cancelled'],
+  // Appointment statuses meaning "this is cancelled" (lowercase), in case
+  // Shop-Ware ever adds a status field. Today only the title prefix and
+  // deletion (404) are used.
+  CANCELLED_STATUSES: ['cancelled', 'canceled', 'deleted'],
 
   // Keyword detection (lowercase) for when Shop-Ware has no dedicated field.
   KEYWORDS: {

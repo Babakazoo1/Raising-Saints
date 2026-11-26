@@ -5,9 +5,13 @@
  *   2. Shop-Ware -> Google: appointments changed since the last run.
  *   3. Hourly: re-check every upcoming synced event against Shop-Ware, removing
  *      ones deleted there and refreshing customer/vehicle details.
+ *
+ * Deletions are rate-limited per run (CONFIG.MAX_DELETES_PER_RUN). Past the
+ * limit they are held back, you get an alert, and resumeDeletes() applies them.
  */
 
 var MANAGED_PREFIX_ERROR = '⚠ NOT IN SHOP-WARE – ';
+var deleteBudget_ = null; // reset at the start of every run
 
 function syncNow() {
   var lock = LockService.getScriptLock();
@@ -17,6 +21,7 @@ function syncNow() {
   }
   try {
     swCredentials_(); // fail fast on missing config
+    deleteBudget_ = CONFIG.MAX_DELETES_PER_RUN;
     var cals = configuredCalendars_();
     pushGoogleChanges_(cals);
     pullShopwareChanges_(cals);
@@ -139,6 +144,8 @@ function upsertAppointment_(cals, view) {
     }
     // Don't create events for appointments outside the window; leave old ones alone.
     if (!live && !inWindow_(view)) return;
+    // A Google deletion held by the safety brake stays deleted until resumed/discarded.
+    if (!live && existing && isDeletionHeld_(view.id)) return;
 
     var body = renderEvent_(view);
     var fp = eventFingerprint_(body);
@@ -222,18 +229,17 @@ function handleGoogleEvent_(cals, c, ev) {
 
   if (ev.status === 'cancelled') {
     if (isSuppressed_(c.id, ev.id) || !swId) return;
-    if (!CONFIG.ALLOW_DELETE_FROM_GOOGLE) {
-      // Put it back: Shop-Ware stays the source of truth for deletions.
-      var keep = swGetAppointment_(swId);
-      if (keep) upsertAppointment_(cals, swLoadView_(keep));
+    var appt = swGetAppointment_(swId);
+    if (!appt || buildView_(appt).cancelled) {
+      removeFromAllCalendars_(cals, swId);
       return;
     }
-    var appt = swGetAppointment_(swId);
-    if (appt && !buildView_(appt).cancelled) {
-      swDeleteAppointment_(swId);
-      console.log('Deleted Shop-Ware appointment #' + swId + ' (deleted in Google).');
+    if (CONFIG.GOOGLE_DELETE_BEHAVIOR === 'restore') {
+      upsertAppointment_(cals, swLoadView_(appt)); // put it back; Shop-Ware decides
+      return;
     }
-    removeFromAllCalendars_(cals, swId);
+    if (!takeDeleteBudget_({ kind: 'google', calId: c.id, eventId: ev.id, swId: swId })) return;
+    applyGoogleDeletion_(cals, swId, appt);
     return;
   }
 
@@ -259,13 +265,6 @@ function fieldName_(rec, names) {
   return names[0];
 }
 
-function wrapWrite_(body) {
-  if (!CONFIG.WRITE_WRAPPER_KEY) return body;
-  var w = {};
-  w[CONFIG.WRITE_WRAPPER_KEY] = body;
-  return w;
-}
-
 /** A synced event was moved or its notes edited in Google. */
 function pushEdit_(cals, ev, swId) {
   var A = CONFIG.FIELDS.appointment;
@@ -286,7 +285,7 @@ function pushEdit_(cals, ev, swId) {
     body[fieldName_(appt, A.notes)] = notes;
   }
   if (Object.keys(body).length) {
-    swUpdateAppointment_(swId, wrapWrite_(body));
+    swUpdateAppointment_(swId, body);
     console.log('Updated Shop-Ware appointment #' + swId + ' from Google: ' + Object.keys(body).join(', '));
   }
   // Re-render from Shop-Ware so every calendar shows the same thing.
@@ -300,16 +299,19 @@ function pushCreate_(cals, c, ev) {
   var summary = String(ev.summary || '').replace(MANAGED_PREFIX_ERROR, '');
   var parsed = parseEventText_(summary, ev.description);
   try {
-    var customer = swFindCustomer_(parsed.fields);
+    // Shop-Ware appointments have no customer field (only a repair order), so
+    // the customer goes in the title and notes for the front desk to see.
+    var title = summary || 'Appointment';
+    var cust = parsed.fields.customer;
+    if (cust && title.toLowerCase().indexOf(cust.toLowerCase()) === -1) title = cust + ' – ' + title;
     var body = {};
     body[A.start[0]] = new Date(ev.start.dateTime).toISOString();
     body[A.end[0]] = new Date(ev.end.dateTime).toISOString();
-    body[A.title[0]] = summary || 'Appointment';
+    body[A.title[0]] = title;
     body[A.notes[0]] = composeShopwareNotes_(parsed).replace(
       '(Created from Google Calendar)', '(Created from Google Calendar: ' + c.cfg.name + ')');
-    if (customer && customer.id !== undefined) body[A.customerId[0]] = customer.id;
 
-    var created = swCreateAppointment_(wrapWrite_(body));
+    var created = swCreateAppointment_(body);
     var newId = pickField_(created, A.id);
     if (newId === undefined) throw new SyncError('DATA', 'Shop-Ware did not return an id for the new appointment.');
     console.log('Created Shop-Ware appointment #' + newId + ' from Google event ' + ev.id);
@@ -318,12 +320,6 @@ function pushCreate_(cals, c, ev) {
     upsertAppointment_(cals, swLoadView_(fresh));
     // Replace the hand-typed event with the managed one just created.
     deleteOurEvent_(c.id, ev.id);
-    if (!customer && (parsed.fields.customer || parsed.fields.phone)) {
-      notify_('DATA', 'link the customer for a new appointment',
-        'An appointment made in Google Calendar ("' + summary + '") was added to Shop-Ware as #' + newId +
-        ', but no single matching customer was found. Open it in Shop-Ware and attach the customer and vehicle.',
-        'NOCUST_' + newId);
-    }
   } catch (e) {
     var err = classifyError_(e);
     if (err.category === 'DATA') {
@@ -365,10 +361,14 @@ function pullShopwareChanges_(cals) {
   if (last) {
     since = new Date(last - 2 * 60000); // overlap protects against clock skew
     query[CONFIG.UPDATED_SINCE_PARAM] = since.toISOString();
+  } else {
+    // First run: only appointments from SYNC_PAST_DAYS ago onwards, not all history.
+    query[CONFIG.START_AFTER_PARAM] = new Date(Date.now() - CONFIG.SYNC_PAST_DAYS * 86400000).toISOString();
   }
   var appts = swListAll_(CONFIG.PATHS.appointments, query);
   var count = 0;
   appts.forEach(function (appt) {
+    if (isOtherShop_(appt)) return;
     if (since) {
       var updated = pickField_(appt, A.updatedAt);
       if (updated && new Date(updated) < since) return;
@@ -416,11 +416,109 @@ function maybeReconcile_(cals, force) {
   Object.keys(ids).forEach(function (swId) {
     try {
       var appt = swGetAppointment_(swId);
-      if (!appt) removeFromAllCalendars_(cals, swId);
-      else upsertAppointment_(cals, swLoadView_(appt));
+      if (!appt) {
+        // Deleted in Shop-Ware (it has no cancelled flag; records just vanish).
+        if (takeDeleteBudget_({ kind: 'shopware', swId: swId })) removeFromAllCalendars_(cals, swId);
+      } else {
+        upsertAppointment_(cals, swLoadView_(appt));
+      }
     } catch (e) {
       handleItemError_('Shop-Ware appointment #' + swId, 'SW_' + swId, e);
     }
   });
   p.setProperty('RECONCILE_AT', String(Date.now()));
+}
+
+// ---------------------------------------------------------------------------
+// Deletions and the safety brake
+// ---------------------------------------------------------------------------
+
+/** Apply GOOGLE_DELETE_BEHAVIOR for an appointment whose event was deleted in Google. */
+function applyGoogleDeletion_(cals, swId, appt) {
+  var A = CONFIG.FIELDS.appointment;
+  if (CONFIG.GOOGLE_DELETE_BEHAVIOR === 'delete') {
+    swDeleteAppointment_(swId);
+    console.log('Deleted Shop-Ware appointment #' + swId + ' (deleted in Google).');
+  } else {
+    var title = String(pickField_(appt, A.title) || swLoadView_(appt).customerName || 'Appointment');
+    var body = {};
+    body[fieldName_(appt, A.title)] = CONFIG.CANCELLED_TITLE_PREFIX + ' ' + title;
+    swUpdateAppointment_(swId, body);
+    console.log('Marked Shop-Ware appointment #' + swId + ' as cancelled (deleted in Google).');
+  }
+  removeFromAllCalendars_(cals, swId);
+}
+
+/**
+ * Returns true if a deletion may go ahead now. Past MAX_DELETES_PER_RUN (or
+ * while paused) the deletion is stored for resumeDeletes() and you get an alert.
+ */
+function takeDeleteBudget_(item) {
+  var p = props_();
+  var paused = !!p.getProperty('DELETES_PAUSED');
+  if (!paused && deleteBudget_ !== null && deleteBudget_ <= 0) {
+    paused = true;
+    p.setProperty('DELETES_PAUSED', String(Date.now()));
+    notify_('SAFETY', 'deletions paused',
+      'More than ' + CONFIG.MAX_DELETES_PER_RUN + ' appointments were deleted at once. In case that was a ' +
+      'mistake (for example a whole calendar deleted), deletions are on hold and nothing more was deleted. ' +
+      'Everything else keeps syncing.');
+  }
+  if (paused) {
+    var held = JSON.parse(p.getProperty('DEFERRED_DELETES') || '[]');
+    var key = JSON.stringify(item);
+    if (!held.some(function (h) { return JSON.stringify(h) === key; })) held.push(item);
+    p.setProperty('DEFERRED_DELETES', JSON.stringify(held));
+    return false;
+  }
+  if (deleteBudget_ !== null) deleteBudget_--;
+  return true;
+}
+
+function isDeletionHeld_(swId) {
+  var raw = props_().getProperty('DEFERRED_DELETES');
+  if (!raw) return false;
+  return JSON.parse(raw).some(function (h) { return h.kind === 'google' && String(h.swId) === String(swId); });
+}
+
+/**
+ * Run from the editor after a "deletions paused" alert, once you've checked
+ * the deletions were intended. Re-checks each one before applying it.
+ */
+function resumeDeletes() {
+  var p = props_();
+  var held = JSON.parse(p.getProperty('DEFERRED_DELETES') || '[]');
+  p.deleteProperty('DELETES_PAUSED');
+  p.deleteProperty('DEFERRED_DELETES');
+  deleteBudget_ = null; // a person said go: no limit for this batch
+  var cals = configuredCalendars_();
+  var done = 0;
+  held.forEach(function (item) {
+    var appt = swGetAppointment_(item.swId);
+    if (item.kind === 'shopware') {
+      if (!appt) { removeFromAllCalendars_(cals, item.swId); done++; }
+      return;
+    }
+    // Google deletion: only apply if the event is still deleted.
+    var ev = getEvent_(item.calId, item.eventId);
+    if (ev && ev.status !== 'cancelled') return;
+    if (appt && !buildView_(appt).cancelled) { applyGoogleDeletion_(cals, item.swId, appt); done++; }
+  });
+  deleteBudget_ = CONFIG.MAX_DELETES_PER_RUN;
+  console.log('Applied ' + done + ' of ' + held.length + ' held deletions.');
+  return done;
+}
+
+/** Undo a pause without applying the held deletions (Google events come back on the next reconcile). */
+function discardHeldDeletes() {
+  var p = props_();
+  var held = JSON.parse(p.getProperty('DEFERRED_DELETES') || '[]');
+  p.deleteProperty('DELETES_PAUSED');
+  p.deleteProperty('DEFERRED_DELETES');
+  var cals = configuredCalendars_();
+  held.forEach(function (item) {
+    var appt = item.kind === 'google' && swGetAppointment_(item.swId);
+    if (appt) upsertAppointment_(cals, swLoadView_(appt)); // restore the Google event
+  });
+  console.log('Discarded ' + held.length + ' held deletions.');
 }

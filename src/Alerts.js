@@ -10,6 +10,7 @@
  *   CONFIG      a required setting is missing
  *   DATA        one appointment/event could not be synced (others still sync)
  *   STALE       health check: no successful sync for a while
+ *   SAFETY      too many deletions at once; deletions paused
  */
 
 function SyncError(category, message, details) {
@@ -36,6 +37,8 @@ var ALERT_ADVICE = {
     'running the sync may have lost access.\n\nTO FIX: open the Apps Script project and run setup() again.',
   CONFIG: 'A required setting is missing.\n\nTO FIX: open Apps Script -> Project Settings -> Script Properties and add it, then run testConnection().',
   DATA: 'One appointment could not be synced. Everything else is still syncing.',
+  SAFETY: 'TO FIX: open the Apps Script project. If the deletions were intended, run resumeDeletes(). ' +
+    'If they were a mistake, run discardHeldDeletes() and the events come back.',
   STALE: 'The sync has not finished successfully for a while, so the calendars may be out of date.\n\n' +
     'TO FIX: open the Apps Script project -> Executions to see the latest error.',
 };
@@ -62,7 +65,7 @@ function notify_(category, subjectDetail, body, key) {
   var now = Date.now();
   if (now - last < CONFIG.ALERT_REPEAT_HOURS * 3600 * 1000) return false;
   p.setProperty(alertKey, String(now));
-  if (category !== 'DATA') p.setProperty('OPEN_ISSUE_' + category, String(now));
+  if (category !== 'DATA' && category !== 'SAFETY') p.setProperty('OPEN_ISSUE_' + category, String(now));
 
   var subject = '⚠️ Calendar sync needs attention: ' + subjectDetail;
   var text = [
@@ -166,6 +169,11 @@ function healthCheck() {
     notify_('STALE', 'no successful sync in ' + (last ? Math.round(ageMin) + ' minutes' : 'a long time'),
       'Last successful sync: ' + (last ? new Date(last).toString() : 'never') +
       '\nLast recorded error: ' + lastErr);
+  }
+  if (p.getProperty('DELETES_PAUSED')) {
+    var held = JSON.parse(p.getProperty('DEFERRED_DELETES') || '[]');
+    notify_('SAFETY', 'deletions are still paused',
+      held.length + ' deletion(s) are waiting for you to review.', 'SAFETY_REMINDER');
   }
   var triggers = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === 'syncNow'; });
   if (!triggers.length) {
